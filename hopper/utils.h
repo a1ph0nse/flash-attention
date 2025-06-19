@@ -21,17 +21,7 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
-
-#define CHECK_CUDA(call)                        \
-    do {                                                                                                  \
-        cudaError_t status_ = call;                                                                       \
-        if (status_ != cudaSuccess) {                                                                     \
-            fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cudaGetErrorString(status_)); \
-            exit(1);                                                                                      \
-        }                                                                                                 \
-    } while(0)
-
-#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
+#include "cuda_check.h"
 
 namespace flash {
 
@@ -106,6 +96,25 @@ static __device__ __forceinline__ T run(T x, Operator &op) {
     return x;
 }
 };
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+CUTLASS_HOST_DEVICE
+int div_floor(cutlass::FastDivmod const& divmod, int dividend) {
+    // Take care of the negative case: https://stackoverflow.com/questions/39304681/division-with-negative-dividend-but-rounded-towards-negative-infinity
+    // Maybe the compiler will turn the -1 - * into bit negation operation, I haven't checked.
+    return dividend >= 0 ? divmod.divide(dividend) : -1 - divmod.divide(-1 - dividend);
+}
+
+CUTLASS_HOST_DEVICE
+int round_down(cutlass::FastDivmod const& divmod, int dividend) {
+    return div_floor(divmod, dividend) * divmod.divisor;
+}
+
+CUTLASS_HOST_DEVICE
+int round_up(cutlass::FastDivmod const& divmod, int dividend) {
+    return div_floor(divmod, dividend - 1) * divmod.divisor + divmod.divisor;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

@@ -10,6 +10,7 @@
 #include "cutlass/device_kernel.h"  // For device_kernel
 #include <cutlass/kernel_hardware_info.h>
 #include "cutlass/cluster_launch.hpp"
+#include "cutlass/kernel_launch.h"
 
 #include "static_switch.h"
 #include "flash.h"
@@ -119,13 +120,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         {params.q_descale_batch_stride, params.q_descale_head_stride},
         {params.k_descale_batch_stride, params.k_descale_head_stride},
         {params.v_descale_batch_stride, params.v_descale_head_stride},
-        params.window_size_left, params.window_size_right,
+        params.window_size_left, params.window_size_right, params.attention_chunk,
         params.softcap,
         params.num_splits,
         params.kv_batch_idx,
         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
         params.seqused_q, params.seqused_k,
-        params.leftpad_k,
+        params.leftpad_k, params.seqlens_rotary
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.o_ptr),
@@ -154,8 +155,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.num_splits_dynamic_ptr,
     };
 
-    if constexpr (Varlen) {
-        prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN);
+    if (Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation) {
+        prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN, Arch >= 90 /*enable_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
 
@@ -186,7 +187,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
-        kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
+        // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
+        cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
+                                           Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
     }
     CHECK_CUDA_KERNEL_LAUNCH();
 }
@@ -203,10 +206,9 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                 // Only needed here to decide if we should use cluster
                 static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap)) : 128;
 
-                // On nvcc 12.8, hdim 128, without cluster is faster (730 vs 700 TFLOPS)
-                static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 192) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKVNonTMA && !Varlen;
+                static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKVNonTMA && !Varlen;
                 BOOL_SWITCH(params.qv_ptr, HasQV_, [&] {
-                    static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_FP8 && kHeadDim == 64 && kHeadDimV == 512;
+                    static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_FP8 && kHeadDim == 64 && kHeadDimV >= 256;
                     APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
                         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                         CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {

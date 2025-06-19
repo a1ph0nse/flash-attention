@@ -353,7 +353,7 @@ struct CollectiveMainloopFwdSm90 {
         ? (NumMmaWarpGroups >= 2) && (!Is_FP8 ? kHeadDim <= 128 : kHeadDim >= 128)
         : NumMmaWarpGroups == 2)
         && !LargeHeadDimV;
-    static constexpr bool RescaleOBeforeGemm = kHeadDim > 128 && (!Is_FP8 || V_colmajor);
+    static constexpr bool RescaleOBeforeGemm = kHeadDim > 128 && (!Is_FP8 || V_colmajor) && IntraWGOverlap;
 
     // Host side kernel arguments
     struct Arguments {
@@ -385,7 +385,7 @@ struct CollectiveMainloopFwdSm90 {
         float const softmax_scale;
         float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
-        int const window_size_left = -1, window_size_right = -1;
+        int const window_size_left = -1, window_size_right = -1, attention_chunk = 0;
         float const softcap_val;
         int const num_splits;
         int const* const kv_batch_idx = nullptr;
@@ -395,6 +395,7 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
+        int const* const seqlens_rotary = nullptr;
     };
 
     // Device side kernel params
@@ -442,6 +443,7 @@ struct CollectiveMainloopFwdSm90 {
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
         float const softcap_val;
         int const window_size_left, window_size_right;
+        cutlass::FastDivmod attention_chunk_divmod;
         int const num_splits;
         int const* const kv_batch_idx = nullptr;
         int const* const cu_seqlens_q = nullptr;
@@ -450,6 +452,7 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
+        int const *const seqlens_rotary = nullptr;
     };
 
     static Params
@@ -534,6 +537,9 @@ struct CollectiveMainloopFwdSm90 {
             assert(page_size % kBlockN == 0);
             assert(!args.leftpad_k);
         }
+        // Avoid dividing by zero
+        cutlass::FastDivmod attention_chunk_divmod(args.attention_chunk >= 1 ? args.attention_chunk : 1);
+        attention_chunk_divmod.divisor = args.attention_chunk;
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -554,11 +560,11 @@ struct CollectiveMainloopFwdSm90 {
                 args.ptr_q_descale, args.ptr_k_descale, args.ptr_v_descale,
                 args.stride_q_descale, args.stride_k_descale, args.stride_v_descale,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
-                args.window_size_left, args.window_size_right,
+                args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -601,7 +607,8 @@ struct CollectiveMainloopFwdSm90 {
         int const split_idx = get<3>(block_coord);
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+            params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
+            params.qhead_per_khead_divmod);
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) {
@@ -658,6 +665,7 @@ struct CollectiveMainloopFwdSm90 {
         auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));  // (TMA)
         Tensor tQsQ = group_modes<0, 3>(block_tma_Q.partition_D(sQ));  // (TMA)
+        if (Use_TMA_Q && thread_idx == 0) { prefetch(params.tma_load_Q, tQgQ); }
         // tma_partition doesn't handle position_independent_swizzle_tensor correctly, so we need to do it manually
         auto block_tma_K = params.tma_load_K.get_slice(cluster_local_block_id.x);
         Tensor tKgK_TMA = group_modes<0, 3>(block_tma_K.partition_S(gK_TMA));  // (TMA, k, batch)
@@ -778,7 +786,7 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_v.producer_commit(smem_pipe_write);
             // Very important: PipelineTmaAsync::consumer_release assumes that the warpgroup is synchronized
             // before calling. Without this we get race conditions.
-            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::ProducerWG) /*id*/);
+            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, cutlass::arch::ReservedNamedBarriers::TransposeBarrier /*id*/);
             pipeline_vt.consumer_release(smem_pipe_read);
         };
 
@@ -968,7 +976,8 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+            params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
+            params.qhead_per_khead_divmod);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -1052,7 +1061,7 @@ struct CollectiveMainloopFwdSm90 {
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
-            params.qhead_per_khead_divmod
+            params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
 
         float softcap_val = params.softcap_val;
@@ -1061,8 +1070,8 @@ struct CollectiveMainloopFwdSm90 {
             float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)];
             softcap_val *= q_descale * k_descale;
         }
-        // Softcapping needs to happen before masking since if we apply after masking, softcapping can turn
-        // -inf to e.g. -50.0, which can affect the attention softmax.
+        // Softcapping needs to happen before masking since if we apply after masking, softcapping
+        // can turn -inf to e.g. -50.0, which can affect the attention softmax.
         auto scoremod_premask_fn = [&](auto& tSrS) {
             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
         };
@@ -1087,11 +1096,11 @@ struct CollectiveMainloopFwdSm90 {
             barrier_Q.wait(work_idx % 2);
         } else {
             if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
-                int const offset_rotary = seqlen_info.seqlen_k_og + seqlen_info.leftpad_k;
                 using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreadsQK, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
                 Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
                                 params.ptr_rotary_sin, params.stride_rotary_sin,
-                                params.is_rotary_interleaved, thread_idx, seqlen_q, offset_rotary);
+                                params.is_rotary_interleaved, thread_idx, seqlen_q,
+                                seqlen_info.seqlen_rotary);
                 Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
                 int const qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
                 if (params.is_rotary_interleaved) {
@@ -1126,10 +1135,6 @@ struct CollectiveMainloopFwdSm90 {
             cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
         }
 
-        // Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
-        clear(tOrO);
-        // tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
-
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
@@ -1156,6 +1161,10 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
             if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             --n_block;
+
+            // Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
+            clear(tOrO);
+            // tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
 
             // Each step does gemm0 for iter n_block, gemm1 for iter n_block + 1, and softmax for iter n_block.
             auto fwd_step = [&](int const n_block, auto mask_fn, auto check_inf_type) {
@@ -1199,20 +1208,18 @@ struct CollectiveMainloopFwdSm90 {
 
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
                 auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-                int const m_idx_min = !PackGQA ? m_block * kBlockM : params.qhead_per_khead_divmod.divide(m_block * kBlockM);
-                int const n_block_min_causal_local_mask =
-                    std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
+                int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
+                    seqlen_info, m_block, n_block_min, params.window_size_right,
+                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
                 #pragma unroll 1
                 for (; n_block >= n_block_min_causal_local_mask; --n_block) {
                     fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
                 }
             }
 
-            int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : params.qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
-            int const n_block_min_before_local_mask = !Is_local
-                ? n_block_min
-                : std::max(n_block_min,
-                           cute::ceil_div(m_idx_max + seqlen_k - seqlen_q - params.window_size_left, kBlockN));
+            int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
+                seqlen_info, m_block, n_block_min, params.window_size_left,
+                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {
@@ -1256,8 +1263,8 @@ struct CollectiveMainloopFwdSm90 {
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
-                warp_scheduler_barrier_arrive();
                 if constexpr (!HasQv) {
+                    warp_scheduler_barrier_arrive();
                     warpgroup_wait<0>();
                     pipeline_k.consumer_release(smem_pipe_read);  // release K
                 } else {
@@ -1265,7 +1272,9 @@ struct CollectiveMainloopFwdSm90 {
                         shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
                     }
                     consumer_wait(pipeline_v, smem_pipe_read);
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/1>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                    warp_scheduler_barrier_arrive();
+                    warpgroup_wait<1>();
                     pipeline_k.consumer_release(smem_pipe_read);  // release K
                     warpgroup_wait<0>();
                 }
@@ -1285,10 +1294,10 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
                 if constexpr (!MmaPV_use_RS_WG1) {
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                    flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 } else {
                     TiledMmaPV_RS tiled_mma_pv_rs;
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                    flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 }
                 if constexpr (!MmaPV_is_RS && MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 warpgroup_wait<0>();
@@ -1300,19 +1309,17 @@ struct CollectiveMainloopFwdSm90 {
             --n_block;
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
                 auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-                int const m_idx_min = !PackGQA ? m_block * kBlockM : params.qhead_per_khead_divmod.divide(m_block * kBlockM);
-                int const n_block_min_causal_local_mask =
-                    std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
+                int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
+                    seqlen_info, m_block, n_block_min, params.window_size_right,
+                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
                 #pragma unroll 1
                 for (; n_block >= n_block_min_causal_local_mask; --n_block) {
                     fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
                 }
             }
-            int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : params.qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
-            int const n_block_min_before_local_mask = !Is_local
-                ? n_block_min
-                : std::max(n_block_min,
-                           cute::ceil_div(m_idx_max + seqlen_k - seqlen_q - params.window_size_left, kBlockN));
+            int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
+                seqlen_info, m_block, n_block_min, params.window_size_left,
+                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {
@@ -1363,7 +1370,8 @@ struct CollectiveMainloopFwdSm90 {
         int const split_idx = get<3>(block_coord);
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+            params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
+            params.qhead_per_khead_divmod);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -1449,7 +1457,8 @@ struct CollectiveMainloopFwdSm90 {
         auto [m_block, bidh, bidb, split_idx] = block_coord;
         auto [n_block_new_min, n_block_new_max] = BlockMN_t::get_n_block_k_new_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+            params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
+            params.qhead_per_khead_divmod);
 
         if (n_block_new_max <= n_block_new_min) { return false; }
 
@@ -1551,7 +1560,8 @@ struct CollectiveMainloopFwdSm90 {
         auto [m_block, bidh, bidb, split_idx] = block_coord;
         auto [n_block_new_min, n_block_new_max] = BlockMN_t::get_n_block_k_new_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+            params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
+            params.qhead_per_khead_divmod);
         if (n_block_new_max <= n_block_new_min) { return false; }
 
         // as_position_independent_swizzle_tensor makes address calculation easier
@@ -1579,12 +1589,12 @@ struct CollectiveMainloopFwdSm90 {
 
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         static constexpr int kHeadDim = get<2>(TileShape_MNK{});
-        int const offset_rotary = seqlen_info.seqlen_k_og + seqlen_info.leftpad_k;
         int const seqlen_k_new = seqlen_info.seqlen_k_new;
         using Rotary_t = Rotary<kBlockN, kHeadDim, NumMmaThreads, Element>;
         Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
                         params.ptr_rotary_sin, params.stride_rotary_sin,
-                        params.is_rotary_interleaved, thread_idx, seqlen_k_new, offset_rotary);
+                        params.is_rotary_interleaved, thread_idx, seqlen_k_new,
+                        seqlen_info.seqlen_rotary);
 
         // This is used to index into the batch dimension of mK and mV
         int const bidb_kv_idx = !is_varlen_k && !params.ptr_pagetable ? bidb_kv : 0;
@@ -1654,7 +1664,7 @@ struct CollectiveMainloopFwdSm90 {
                     rotary.template apply_K_contiguous<PagedKVNonTMA>(sK(_, _, smem_pipe_read.index()), gK_cur, tKpK, tRrCosCont, tRrSinCont, tPrKPtr, n_block, get<1>(params.shape_K));
                 }
             }
-            // Without this sync I'm getting race condition when seqlen_k is large
+            // Without this fence I'm getting race condition when seqlen_k is large
             cutlass::arch::fence_view_async_shared();
             // Very important: PipelineTmaAsync::consumer_release assumes that the warpgroup is synchronized
             // before calling.
