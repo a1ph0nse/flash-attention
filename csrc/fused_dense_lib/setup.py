@@ -31,7 +31,7 @@ setup(
             name='fused_dense_lib',
             sources=['fused_dense.cpp', 'fused_dense_cuda.cu'],
             extra_compile_args={
-                               'cxx': ['-O3',],
+                               'cxx': ['-O3'],
                                'nvcc': append_nvcc_threads(['-O3'])
                                }
             )

@@ -131,6 +131,7 @@ struct Flash_fwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+    // 用于copy转换为fp16的O，此时的O已经可以作为最终结果了
     using GmemTiledCopyO = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
                         GmemLayoutAtom{},
@@ -143,6 +144,9 @@ struct Flash_fwd_kernel_traits : public Base {
         Layout<Shape <_8, _16>,  // Thread layout, 16 threads per row
                Stride< _16, _1>>
     >;
+
+    // 用于copy fp32的Oaccum，即O的累加值，此时的O仍不是最终结果，还需要经过运算
+    // 在flash-decoding中使用
     using GmemTiledCopyOaccum = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
                         GmemLayoutAtomOaccum{},

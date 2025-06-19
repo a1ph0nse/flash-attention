@@ -62,7 +62,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.b, params.h);
+    // 检查是否规则，如果不规则，那么在后续计算中需要对超出范围的元素进行过滤
+    // 检查seqlen_q和kBlockM，seqlen_k和kBlockN是否规则
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
+    // head_dim是否规则
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     const bool return_softmax = params.p_ptr != nullptr;
     BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
@@ -104,6 +107,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+    // 如果采用了splits，相当于将batch_size和head_num合并起来，切分kv并行，
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
@@ -111,6 +115,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
             LOCAL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !Is_causal, Is_local, [&] {
                 BOOL_SWITCH(params.num_splits > 1, Split, [&] {
+                    // 如果提供了新的kv, 则需要追加到kv cache中
                     BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV, [&] {
                         ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
                             SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
@@ -134,9 +139,11 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         });
     });
     if (params.num_splits > 1) {
+        // reduce split kv后得到的结果
         // We want kBlockM to be as small as possible for more parallelism.
         // With 128 threads we can load 512 elements at a time, so if headdim is divisible by 128, kBlockM = 4.
         // If headdim is divisible by 64, then we set kBlockM = 8, etc.
+        // 这里用的kBlockM与上面的不同
         constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
         dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
@@ -187,6 +194,7 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
             // Using block size (64 x 256) is 27% slower for seqlen=2k
             // Using block size (256 x 64) is 85% slower for seqlen=2k, because of register spilling
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 256, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
         } else {
@@ -234,6 +242,7 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
             if (is_sm8x) {
                 if constexpr(!Is_causal) {
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                    // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 256, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
                 } else {
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
                 }

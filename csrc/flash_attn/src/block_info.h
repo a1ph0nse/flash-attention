@@ -9,7 +9,7 @@ namespace FLASH_NAMESPACE {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<bool Varlen=true>
+template<bool Varlen=true> // !is_even_MN
 struct BlockInfo {
 
     template<typename Params>
@@ -42,6 +42,17 @@ struct BlockInfo {
     const int leftpad_k;
     const int seqlen_k_cache;
     const int actual_seqlen_k;
+
+    // 如果cu_seqlens_q, cu_seqlens_k, leftpad_k==nullptr, seqused_k == None,knew_ptr == nullptr
+    // sum_s_q = -1;
+    // sum_s_k = -1;
+    // actual_seqlen_q = params.seqlen_q;
+    // leftpad_k = 0;
+    // seqlen_k_cache = seqlen_k
+    // actual_seqlen_k = seqlen_k
+    // q_offset = batch_idx * batch_stride
+    // k_offset = batch_idx * batch_stride
+
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

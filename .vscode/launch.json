@@ -1,0 +1,34 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Launch",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "python": "/home/chenjw/.conda/envs/fa/bin/python",
+            "env": {
+                "CUDA_LAUNCH_BLOCKING": "1"
+            },
+        },
+        {
+            "name": "CUDA GDB Server: Launch",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": "/home/chenjw/.conda/envs/fa/bin/python", //修改为Python路径
+            "args": ["${file}"],
+            "debuggerPath": "/opt/nvidia/hpc_sdk/Linux_x86_64/24.9/compilers/bin/cuda-gdb", // 确认cuda-gdb路径正确
+            "initCommands": [
+                "break /home/chenjw/Learn/fa/flash-attention/csrc/flash_attn/flash_api.cu:370",
+                "file /home/chenjw/.conda/envs/fa/bin/python"
+            ]
+        }
+    ],
+    "compounds": [
+    {
+        "name": "Python and CUDA",
+        "configurations": ["Python: Launch", "CUDA GDB Server: Launch"]
+    }
+]
+}

@@ -196,9 +196,9 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
     ext_modules.append(
         CUDAExtension(
-            name="flash_attn_2_cuda",
+            name="flash_attn_2_cuda_dev",
             sources=[
-                "csrc/flash_attn/flash_api.cpp",
+                "csrc/flash_attn/flash_api.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu",
@@ -300,12 +300,12 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                         # "--ptxas-options=-v",
                         # "--ptxas-options=-O2",
                         # "-lineinfo",
-                        # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                        # "-DFLASHATTENTION_DISABLE_DROPOUT",
-                        # "-DFLASHATTENTION_DISABLE_ALIBI",
-                        # "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                        # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-                        # "-DFLASHATTENTION_DISABLE_LOCAL",
+                        "-DFLASHATTENTION_DISABLE_BACKWARD",
+                        "-DFLASHATTENTION_DISABLE_DROPOUT",
+                        "-DFLASHATTENTION_DISABLE_ALIBI",
+                        "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                        "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+                        "-DFLASHATTENTION_DISABLE_LOCAL",
                     ]
                     + cc_flag
                 ),

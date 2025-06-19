@@ -35,9 +35,9 @@ make_tiled_copy_B_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
                                   TiledMMA           const& tiled_mma) {
     constexpr int TileShape_N = decltype(tiled_mma.template tile_size_mnk<1>())::value;
     constexpr int TileShape_K = decltype(tiled_mma.template tile_size_mnk<2>())::value;
-    using AtomShape_MNK = typename TiledMMA::AtomShape_MNK;
-    constexpr int AtomShape_N = decltype(size<1>(AtomShape_MNK{}))::value;
-    // Divide by 2 because right now we always use 2 for the ValLayout
+    using AtomShape_MNK = typename TiledMMA::AtomShape_MNK; // 16x8x16
+    constexpr int AtomShape_N = decltype(size<1>(AtomShape_MNK{}))::value; // 8
+    // Divide by 2 because right now we always use 2 for the ValLayout(N)
     constexpr int kNWarpsN = TileShape_N / AtomShape_N / 2;
     constexpr int MMAStride_N = MMA_N * AtomShape_N * 2;
     // This gives the correct layout, idk why.
@@ -452,6 +452,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     FLASH_NAMESPACE::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
+    // 内循环，前面都是G->S的copy
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
         clear(acc_s);

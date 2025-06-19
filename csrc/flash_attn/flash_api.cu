@@ -260,9 +260,18 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
 // splits as that would incur more HBM reads/writes.
 // So we find the best efficiency, then find the smallest number of splits that gets 85%
 // of the best efficiency.
+// 先找到最佳效率，然后找到能得到最佳效率85%的最小切片数量
+// 切片数量多了SM占用率高，但会导致更多的HBM读写
 inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
     // If we have enough to almost fill the SMs, then just use 1 split
+    // batch_size * num_head * num_m_blocks是block的数量
+    // 将block的数量/(num_SM*2)作为occupancy，如果occupancy>=0.8则只分1块
+    // 在prefill阶段，batch_size和seqlen_q通常较大，通常都会超过
+    // 对A100：0.8 * sm_num(108) * 2 = 172.8
+    // 如果head_num是32/16的话, batch_size * num_m_block == 5.4/10.8就行了，一般都会满足
+    // 可能只有decode阶段seqlen == 1且batch_size和head_num都较小的情况才会达不到
     if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
+    // 取max_splits, num_sm, n_block的最小值
     max_splits = std::min({max_splits, num_SMs, num_n_blocks});
     float max_efficiency = 0.f;
     std::vector<float> efficiency;
@@ -272,6 +281,7 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
     // we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks
     // (i.e. it's 11 splits anyway).
     // So we check if the number of blocks per split is the same as the previous num_splits.
+    // 除去无意义（本质上相等的nsplits）只留下有意义的nsplits，就像上面解释的一样
     auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
         return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
     };
@@ -279,7 +289,10 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
         if (!is_split_eligible(num_splits)) {
             efficiency.push_back(0.f);
         } else {
+            // block_num * num_splits / num_sm
+            // 相当于splits后，每个SM执行的block数量
             float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
+            // ceil后应该是1，计算效率
             float eff = n_waves / ceil(n_waves);
             // printf("num_splits = %d, eff = %f\n", num_splits, eff);
             if (eff > max_efficiency) { max_efficiency = eff; }
@@ -288,6 +301,7 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
     }
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
         if (!is_split_eligible(num_splits)) { continue; }
+        // 如果效率最大值的0.85则返回
         if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
             // printf("num_splits chosen = %d\n", num_splits);
             return num_splits;
@@ -302,10 +316,14 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const int num_splits, const int num_sm, struct c10::TensorOptions opts) {
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
+    // 匹配run_mha_fwd_splitkv_dispatch
+    // 按照head_dim确定对kv的分块大小
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+    // 对kv的分块数量
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
+    // 对q的分块数量，分块大小固定为64
     const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
     params.num_splits = num_splits;
     at::Tensor softmax_lse_accum;
@@ -314,6 +332,8 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
         if (num_splits < 1) {
             // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
+            // SM数量x2来硬编码每个block使用128线程的事实（？这怎么hard-code）
+            // batch_nheasds_mblocks, num_SMs, num_n_blocks, max_splits
             params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
         }
         if (params.num_splits > 1) {
@@ -400,6 +420,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     if (window_size_right >= seqlen_k) { window_size_right = -1; }
 
     // causal=true is the same as causal=false in this case
+    // 通常seqlen_q == 1代表decode阶段
     if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
     if (is_causal) { window_size_right = 0; }
 
@@ -592,6 +613,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
+        // 如果满足条件，则将MQA和MGA打包计算
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size});
         max_seqlen_q = ngroups;
         num_heads = num_heads_k;
@@ -1264,12 +1286,15 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(!paged_KV || page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
     const int seqlen_k = !paged_KV ? kcache.size(1) : max_num_blocks_per_seq * page_block_size;
     const int num_heads_k = kcache.size(2);
+    // naive kvcache的batch_size就是kvcache的batch_size
+    // kv cache容量有限，可能不等于q的batch_size
     const int batch_size_c = !paged_KV ? kcache.size(0) : batch_size;
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     // causal=true is the same as causal=false in this case
+    // decoding阶段自带causal效果，不需要采用causal mask
     if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
     if (is_causal) { window_size_right = 0; }
 
@@ -1296,6 +1321,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     }
 
+    // pad不整除8的head_dim
     at::Tensor q_padded, kcache_padded, vcache_padded;
     if (head_size_og % 8 != 0) {
         q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
@@ -1349,6 +1375,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      softcap
                      );
 
+    // 这里的kv指新的kv（不在kv cache中）
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {
         TORCH_CHECK(v_.has_value(), "If key is supplied, value must also be passed in");
@@ -1383,6 +1410,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         params.vnew_head_stride = v_padded.stride(-2);
     }
 
+    // 每个batch的seqlen
     if (seqlens_k_.has_value()) {
         auto seqlens_k = seqlens_k_.value();
         TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqlens_k must have dtype int32");
@@ -1428,6 +1456,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         params.rotary_dim = 0;
     }
 
+    // kv cache中kv关于batch的索引，默认为(0, 1, ..., batch_size - 1)
     if (cache_batch_idx_.has_value()) {
         auto cache_batch_idx = cache_batch_idx_.value();
         CHECK_DEVICE(cache_batch_idx);
@@ -1456,6 +1485,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     // or paged KV cache
     run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
 
+    // 还原pad的kv和o
     if (head_size_og % 8 != 0) {
         out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
         if (out_.has_value()) { out_.value().copy_(out); }

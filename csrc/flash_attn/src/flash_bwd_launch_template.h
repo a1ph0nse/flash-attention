@@ -69,6 +69,7 @@ __global__ void flash_bwd_convert_dkv_kernel(const Flash_bwd_params params) {
     FLASH_NAMESPACE::convert_dKV<Kernel_traits>(params);
 }
 
+// 调用的是这个
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) {
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;

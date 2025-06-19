@@ -91,6 +91,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
     // We exit early and write 0 to gO and gLSE. This also covers the case where actual_seqlen_k == 0.
     // Otherwise we might read OOB elements from gK and gV.
+    // 可能因为causal/local attn/不能整除/seqlen_k == 0，部分行不需要计算，因此这里需要跳过计算
     if ((Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min) {
         Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
                                               + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
@@ -131,7 +132,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
     // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
-
+    // 获取QKV在gmem中的指针
     const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
         + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
 
@@ -156,7 +157,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
                             Shape<Int<kBlockM>, Int<kBlockN>>{},
                             make_stride(params.seqlen_k_rounded, _1{}));
-
+    // 获取QKV在smem中的指针
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
     // Careful we're using the same smem for sQ and sK | sV if Share_Q_K_smem;
@@ -166,6 +167,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
+    // 为数据迁移切片
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
 
@@ -190,6 +192,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // Copy Atom retiling
     //
 
+    // 根据mma的shape对smem进行切片
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
     // if (cute::thread0()) {smem_thr_copy_Q.print_all();}
@@ -246,6 +249,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // Prologue
 
+    // 从gmem将数据Q移动到smem
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
                                        binfo.actual_seqlen_q - m_block * kBlockM);
@@ -265,6 +269,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     int n_block = n_block_max - 1;
+    // 从gmem将数据K移动到smem
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
@@ -299,6 +304,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         ? 1
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
     #pragma unroll
+    // 要对S进行mask的
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
@@ -375,6 +381,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     // These are the iterations where we don't need masking on S
+    // 没有mask的内循环
     for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
@@ -383,6 +390,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         cute::cp_async_fence();
 
+        // S=QK
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -403,7 +411,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
-
+        // 计算统计量m l P
+        // acc_s是S,acc_o是O
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
@@ -424,12 +433,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
+        // 修改P的shape方便计算O
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+        // 更新O，加上PV
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
     // Epilogue
-
+    // 计算L = m + log l
     Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
 
     // Convert acc_o from fp32 to fp16/bf16
@@ -438,12 +449,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // Partition sO to match the accumulator partitioning
     auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
+    // 划分张量使其适合数据传输
     Tensor taccOrO = smem_thr_copy_O.retile_S(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
     Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
     // sO has the same size as sQ, so we don't need to sync here.
     if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
-
+    // 将寄存器中的O写到smem中原来Q的位置
     cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
 
     Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
@@ -495,6 +507,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// 如果不用flash-decoding: split = false, n_split_idx = 0, num_n_splits = 1
+// 整体流程与compute_attn_1rowblock一致，但在寻址上差别较大
 template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
@@ -525,10 +539,13 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
+    // 确定每个split要处理的n_block数量
     const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
+    // 确定n_block的索引
     const int n_block_min = !Is_local
         ? n_split_idx * n_blocks_per_split
         : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
+    // 确定最大值
     int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
     if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,
@@ -1107,11 +1124,13 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// reduce split kv的结果
 template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
 inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
+    // 根据分块数量的log_2计算的，kv最大分块数量
     constexpr int kMaxSplits = 1 << Log_max_splits;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNThreads = Kernel_traits::kNThreads;
@@ -1131,39 +1150,57 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     const index_t lse_size = params.b * params.h * params.seqlen_q;
 
     const index_t row_offset_lse = bidx * kBlockM;
+    // 一个block就处理kBlockM行，被转置了
     Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lse),
                                    Shape<Int<kMaxSplits>, Int<kBlockM>>{},
                                    make_stride(lse_size, _1{}));
 
     // LSE format is different depending on params.unpadded_lse and params.seqlenq_ngroups_swapped, see comment in get_lse_tile.
     // This tensor's layout maps row_offset_lse to {bidb, bidh, q_offset}.
+    // 一个Q分块的lse结果，每一行都是独立的
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
                               Shape<Int<kBlockM>>{}, Stride<_1>{});
 
     // This layout maps row_offset_lse to {bidh, q_offset, bidb} or {bidh, bidb, q_offset}.
+    // 将lse_offset映射到shape(head_num, batch_size, seqlen_q)
+    // composition(a, b)是使用layout b经过布局转换后得到的索引，选取layout a中对应位置的索引，组成新的layout
     Layout flat_layout = make_layout(lse_size);
+    // origin_layout相当于(bs, h sq)的转置(不改变stride)
     Layout orig_layout = make_layout(make_shape(params.seqlen_q, params.h, params.b));
+    // remapped_layout和final_layout相当于(h, bs, sq)的转置(不改变stride)
     auto transposed_stride = params.seqlenq_ngroups_swapped ? make_stride(params.b, params.seqlen_q * params.b, 1) : make_stride(1, params.seqlen_q * params.b, params.seqlen_q);
     Layout remapped_layout = make_layout(make_shape(params.seqlen_q, params.h, params.b), transposed_stride);
+    // 这里的composition类似复合函数，先经过remapped_layout进行映射，然后再经过orig_layout和flat_layout
+    // 根据seqlen_q, head num, batch size映射到最终结果
     Layout final_layout = cute::composition(remapped_layout, cute::composition(orig_layout, flat_layout));
-
+    // 所有lse的结果，在varlen时才有用
     Tensor gLSE_unpadded = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr)), final_layout);
 
+    // 每个线程处理多少个lse分块
+    // 设(32 * 8 + 128 -1) / 128 = 2
     constexpr int kNLsePerThread = (kMaxSplits * kBlockM + kNThreads - 1) / kNThreads;
 
+    // 同一线程的多个load之间间隔多少行
+    // Lse的G->S，同时转置
+    // 设128/8=16
     // Read the LSE values from gmem and store them in shared memory, then transpose them.
     constexpr int kRowsPerLoadLSE = kNThreads / kBlockM;
     #pragma unroll
     for (int l = 0; l < kNLsePerThread; ++l) {
+        // 每个线程load的lse分块的行列坐标(每行的每个线程copy的lse分块,tidx % kBlockM)
         const int row = l * kRowsPerLoadLSE + tidx / kBlockM;
         const int col = tidx % kBlockM;
+        // 超出范围会mask掉
         ElementAccum lse = (row < params.num_splits && col < lse_size - bidx * kBlockM) ? gLSEaccum(row, col) : -INFINITY;
         if (row < kMaxSplits) { sLSE[row][col] = lse; }
         // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse); }
     }
     // if (bidx == 1 && tidx < 32) { printf("tidx = %d, row_offset_lse = %d, lse = %f\n", tidx, row_offset_lse, lse_accum(0)); }
     __syncthreads();
+    // 一个线程处理的lse累加值(2, )
     Tensor lse_accum = make_tensor<ElementAccum>(Shape<Int<kNLsePerThread>>{});
+    // 每行lse分块的数量和每行拷贝用到的线程数量的最小值 min(16, 32)
+    // 表示每个分块在一行上计算用到的线程数量
     constexpr int kRowsPerLoadTranspose = std::min(kRowsPerLoadLSE, kMaxSplits);
     // To make sure that kMaxSplits is within 1 warp: we decide how many elements within kMaxSplits
     // each thread should hold. If kMaxSplits = 16, then each thread holds 2 elements (128 threads,
@@ -1172,6 +1209,10 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     // static_assert(kThreadsPerSplit <= 32);
     static_assert(kRowsPerLoadTranspose <= 32);
     static_assert(kNLsePerThread * kRowsPerLoadTranspose <= kMaxSplits);
+    // 下面的copy与gLSEaccum->sLSE的copy不同
+    // 进行了转置，之前在kBlockM维度（列）上是连续的线程号
+    // 现在变成了在kMaxSplits维度（行）上是连续的线程号
+    // 现在，线程0~15处理的是lse同一行的分块,16~31处理的又是同一行，以此类推
     #pragma unroll
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
@@ -1182,11 +1223,15 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
 
     // Compute the logsumexp of the LSE along the split dimension.
     ElementAccum lse_max = lse_accum(0);
+    // 先找到每个线程保存的最大lse
+    // 先AllReduce找到每行（存在16个线程中）最大的lse
     #pragma unroll
     for (int l = 1; l < kNLsePerThread; ++l) { lse_max = max(lse_max, lse_accum(l)); }
     MaxOp<float> max_op;
     lse_max = Allreduce<kRowsPerLoadTranspose>::run(lse_max, max_op);
     lse_max = lse_max == -INFINITY ? 0.0f : lse_max;  // In case all local LSEs are -inf
+    // 减去最大的lse防止数值溢出。
+    // 使用AllReduce求rowsum(exp(lse - lse_max))
     float lse_sum = expf(lse_accum(0) - lse_max);
     #pragma unroll
     for (int l = 1; l < kNLsePerThread; ++l) { lse_sum += expf(lse_accum(l) - lse_max); }
@@ -1194,8 +1239,11 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     lse_sum = Allreduce<kRowsPerLoadTranspose>::run(lse_sum, sum_op);
     // For the case where all local lse == -INFINITY, we want to set lse_logsum to INFINITY. Otherwise
     // lse_logsum is log(0.0) = -INFINITY and we get NaN when we do lse_accum(l) - lse_logsum.
+    // 对lse求log-sum-exp = log(rowsum(exp(lse - lse_max))) + lse_max
+    // 对lse的log-sum-exp求exp后得到的就是rowsum(exp(lse))
     ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
     // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
+    // 处理一行lse分块的线程组的第1个线程将lse_log_sum拷贝到gLSE作为最终结果
     if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
         if (params.unpadded_lse) {
             const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
@@ -1207,6 +1255,9 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
         }
     }
     // Store the scales exp(lse - lse_logsum) in shared memory.
+    // 计算exp(lse - lse_logsum)，写入smem
+    // sLSE (kMaxSplits, kBlockM)
+    // 0~15处理O的同一行（sLSE中的一列）
     #pragma unroll
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
@@ -1215,6 +1266,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     }
     __syncthreads();
 
+    // 处理O
     const index_t row_offset_oaccum = bidx * kBlockM * params.d_rounded;
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.oaccum_ptr) + row_offset_oaccum),
                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -1227,6 +1279,8 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
                         Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
     GmemTiledCopyOaccum gmem_tiled_copy_Oaccum;
     auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
+    // G->R
+    // (CPY, CPY_M, CPY_N) = ((1, 4), 1, 1)
     Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_S(gOaccum);
     Tensor tOrO = make_tensor<ElementAccum>(shape(tOgOaccum));
     Tensor tOrOaccum = make_tensor<ElementAccum>(shape(tOgOaccum));
@@ -1242,6 +1296,10 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
         for (int k = 0; k < size(tOpOaccum); ++k) { tOpOaccum(k) = get<1>(tOcOaccum(0, 0, k)) < params.d; }
     }
     // Load Oaccum in then scale and accumulate to O
+    // 用smem中的lse scale O后累加
+    // 对于每个KV分块的Oaccum，都需要乘上用对应的lse去scale
+    // scale = exp(lse - lse_logsum)，更新每个KV分块对应的Oaccum的分母
+    // 之后求和，合并矩阵分块乘法结果。
     for (int split = 0; split < params.num_splits; ++split) {
         FLASH_NAMESPACE::copy</*Is_even_MN=*/false, Is_even_K>(
             gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
@@ -1259,12 +1317,14 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             }
         // if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE[split][0], sLSE[split][1]); print(tOrOaccum); }
         }
+        // 同一行下一个KV分块的Oaccum
         tOgOaccum.data() = tOgOaccum.data() + params.b * params.h * params.seqlen_q * params.d_rounded;
     }
     // if (cute::thread0()) { print_tensor(tOrO); }
 
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(tOrO);
     // Write to gO
+    // R->G
     #pragma unroll
     for (int m = 0; m < size<1>(rO); ++m) {
         const int idx = bidx * kBlockM + get<0>(tOcOaccum(0, m, 0));

@@ -108,6 +108,7 @@ __device__ __forceinline__ T operator()(T const & x, T const & y) { return x + y
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// 获取tidx xor OFFSET指向线程的数据进行op操作
 template<int THREADS>
 struct Allreduce {
     static_assert(THREADS == 32 || THREADS == 16 || THREADS == 8 || THREADS == 4);

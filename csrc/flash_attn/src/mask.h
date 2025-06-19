@@ -141,14 +141,19 @@ struct Mask {
             Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tensor_.layout()));
             // Do we need both row and column indices, or just column incides?
             static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
+            // 一个Atom用32个thread,每个thread对应不同位置
+            // 采用多个warp时，tidx % 32相同的thread处理的位置是对应的
             const int lane_id = threadIdx.x % 32;
+            // 对Atom16x8x16，每一列有4个thread，1个thread处理2个element，因此要x2
             const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
             if constexpr (Col_idx_only) {
                 #pragma unroll
                 for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+                    // stride是8, 8个reg（16个element）后就是mma Atom下一次处理的
                     const int col_idx_base = col_idx_offset + nj * 8;
                     #pragma unroll
                     for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                        // 2个reg中的哪一个
                         const int col_idx = col_idx_base + j;
                         #pragma unroll
                         for (int mi = 0; mi < size<0>(tensor); ++mi) {
